@@ -1,0 +1,38 @@
+name: Compiler le .nwa
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer les outils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi make
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Récupérer l'appli d'exemple officielle NumWorks
+        run: git clone --depth 1 https://github.com/numworks/epsilon-sample-app-c.git base
+
+      - name: Mettre nos sources à la place de celles de l'exemple
+        run: |
+          cp src/*.c base/src/
+          cd base
+          sed -i 's/nwlink@0\.0\.16/nwlink@0.0.19/; s/eadk-cflags)/eadk-cflags-device)/' Makefile
+
+      - name: Compiler
+        run: make -C base
+
+      - name: Publier le .nwa
+        uses: actions/upload-artifact@v4
+        with:
+          name: multijeux-nwa
+          path: base/output/*.nwa
