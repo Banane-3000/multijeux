@@ -1,4 +1,4 @@
-name: Compiler le .nwa
+name: Fusionner les .nwa
 
 on:
   push:
@@ -20,16 +20,99 @@ jobs:
           node-version: 20
 
       - name: Récupérer l'appli d'exemple officielle NumWorks
-        run: git clone --depth 1 https://github.com/numworks/epsilon-sample-app-c.git base
-
-      - name: Mettre nos sources à la place de celles de l'exemple
         run: |
-          cp src/*.c base/src/
-          cd base
-          sed -i 's/nwlink@0\.0\.16/nwlink@0.0.19/; s/eadk-cflags)/eadk-cflags-device)/' Makefile
+          git clone --depth 1 https://github.com/numworks/epsilon-sample-app-c.git base
+          sed -i 's/nwlink@0\.0\.16/nwlink@0.0.19/; s/eadk-cflags)/eadk-cflags-device)/' base/Makefile
 
-      - name: Compiler
+      - name: Générer le menu (main.c)
+        run: |
+          python3 - <<'PY'
+          import glob, os
+          files = sorted(glob.glob('nwa/*.nwa'))
+          if not files:
+              raise SystemExit("ERREUR : aucun fichier .nwa dans le dossier nwa/")
+          if len(files) > 8:
+              raise SystemExit("ERREUR : 8 jeux maximum dans le menu")
+          names = [os.path.basename(f)[:-4].replace('_', ' ').replace('-', ' ').replace('"', '') for f in files]
+          decls = "\n".join("extern int game_%d_main(int, char **);" % (i + 1) for i in range(len(files)))
+          nm = ", ".join('"%s"' % n for n in names)
+          en = ", ".join("game_%d_main" % (i + 1) for i in range(len(files)))
+          c = r'''#include "eadk.h"
+          #include <stddef.h>
+          const char eadk_app_name[] __attribute__((section(".rodata.eadk_app_name"))) = "Multijeux";
+          const uint32_t eadk_api_level __attribute__((section(".rodata.eadk_api_level"))) = 0;
+          typedef int (*entry_t)(int, char **);
+          @DECLS@
+          static const char *const names[] = { @NAMES@ };
+          static const entry_t entries[] = { @ENTRIES@ };
+          #define COUNT ((int)(sizeof(entries) / sizeof(entries[0])))
+          static void wait_release(void) { while (eadk_keyboard_scan() != 0) { eadk_timing_msleep(20); } }
+          static void draw_menu(int sel) {
+            eadk_display_push_rect_uniform((eadk_rect_t){0, 0, 320, 240}, eadk_color_white);
+            eadk_display_draw_string("Choisis un jeu", (eadk_point_t){10, 8}, true, eadk_color_black, eadk_color_white);
+            for (int i = 0; i < COUNT; i++) {
+              uint16_t y = (uint16_t)(36 + i * 22);
+              eadk_color_t bg = (i == sel) ? 0x001F : eadk_color_white;
+              eadk_color_t fg = (i == sel) ? eadk_color_white : eadk_color_black;
+              eadk_display_push_rect_uniform((eadk_rect_t){0, y, 320, 20}, bg);
+              eadk_display_draw_string(names[i], (eadk_point_t){12, (uint16_t)(y + 2)}, false, fg, bg);
+            }
+          }
+          int main(int argc, char *argv[]) {
+            int sel = 0;
+            draw_menu(sel);
+            while (1) {
+              eadk_keyboard_state_t k = eadk_keyboard_scan();
+              if (eadk_keyboard_key_down(k, eadk_key_down) && sel < COUNT - 1) { sel++; draw_menu(sel); wait_release(); }
+              else if (eadk_keyboard_key_down(k, eadk_key_up) && sel > 0) { sel--; draw_menu(sel); wait_release(); }
+              else if (eadk_keyboard_key_down(k, eadk_key_ok) || eadk_keyboard_key_down(k, eadk_key_exe)) {
+                wait_release();
+                entries[sel](0, NULL);
+                wait_release();
+                draw_menu(sel);
+              }
+              eadk_timing_msleep(20);
+            }
+            return 0;
+          }
+          '''
+          c = c.replace('@DECLS@', decls).replace('@NAMES@', nm).replace('@ENTRIES@', en)
+          open('base/src/main.c', 'w').write(c)
+          print(c)
+          PY
+
+      - name: Compiler le menu
         run: make -C base
+
+      - name: Préparer chaque jeu (renommer main, cacher les symboles)
+        run: |
+          mkdir -p work
+          i=0
+          for f in nwa/*.nwa; do
+            i=$((i+1))
+            echo "=== Jeu $i : $f"
+            cp "$f" work/g$i.o
+            arm-none-eabi-objcopy --redefine-sym main=game_${i}_main work/g$i.o
+            arm-none-eabi-objcopy --keep-global-symbol=game_${i}_main \
+              --rename-section .rodata.eadk_app_name=.rodata.junk_name_$i \
+              --rename-section .rodata.eadk_api_level=.rodata.junk_level_$i \
+              --rename-section .rodata.eadk_app_icon=.rodata.junk_icon_$i \
+              work/g$i.o
+            echo "Symboles définis restés globaux (doit être seulement game_${i}_main) :"
+            arm-none-eabi-nm --defined-only work/g$i.o | awk '$2 ~ /^[A-Z]$/' || true
+          done
+
+      - name: Assembler le .nwa final
+        run: |
+          cd base
+          OBJS=$(ls ../work/g*.o | tr '\n' ' ')
+          make -n -B > ../make_dry.txt
+          LINK=$(grep -E 'arm-none-eabi-gcc.* -o [^ ]*\.nwa' ../make_dry.txt | tail -1)
+          if [ -z "$LINK" ]; then echo "Commande d'édition de liens introuvable :"; cat ../make_dry.txt; exit 1; fi
+          LINK=$(echo "$LINK" | sed "s# -o # $OBJS -o #")
+          echo "$LINK"
+          eval "$LINK"
+          ls -l output/*.nwa
 
       - name: Publier le .nwa
         uses: actions/upload-artifact@v4
